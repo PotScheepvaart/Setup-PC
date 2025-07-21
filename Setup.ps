@@ -1,0 +1,251 @@
+<#
+This PowerShell script debloats and configures Windows 11 with performance, privacy, and user experience enhancements.
+Includes: UI tweaks, privacy hardening, Chocolatey installs, default app removal, and company software deployment.
+#>
+
+# Ensure script is running as admin
+if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+    Write-Error "This script must be run as Administrator!"
+    exit 1
+}
+
+# Change the execution policy to RemoteSigned
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
+
+# Prompt to rename the PC
+$newPCName = Read-Host -Prompt "Enter a new computer name (leave blank to skip renaming)"
+if ($newPCName -and $newPCName -ne $env:COMPUTERNAME) {
+    Rename-Computer -NewName $newPCName -Force
+}
+
+# Create a local user account named 'share' with password 'share'
+Write-Host "Creating local user 'share'..."
+$Username = "share"
+$Password = ConvertTo-SecureString "share" -AsPlainText -Force
+if (-not (Get-LocalUser -Name $Username -ErrorAction SilentlyContinue)) {
+    New-LocalUser -Name $Username -Password $Password -FullName "Share User" -Description "User account for file sharing"
+    Add-LocalGroupMember -Group "Users" -Member $Username
+}
+
+
+# Enable file sharing on private networks and disable password-protected sharing
+Write-Host "Configuring file sharing settings..."
+Set-NetFirewallRule -DisplayGroup "File and Printer Sharing" -Profile Private -Enabled True
+Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force
+Set-SmbServerConfiguration -EnableSMB2Protocol $true -Force
+Set-SmbServerConfiguration -EncryptData $false -Force
+Set-SmbServerConfiguration -RequireSecuritySignature $false -Force
+Set-SmbServerConfiguration -EnableSecuritySignature $false -Force
+Set-SmbServerConfiguration -AutoDisconnectTimeout 0 -Force
+Set-SmbServerConfiguration -RejectUnencryptedAccess $false -Force
+Set-SmbServerConfiguration -EnableAuthenticateUserSharing $false -Force
+Set-SmbServerConfiguration -EnableLeasing $true -Force
+Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "LimitBlankPasswordUse" -Value 0
+Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters" -Name "restrictnullsessaccess" -Value 0
+$sharePath = "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Shares"
+if (!(Test-Path $sharePath)) {
+    New-Item -Path $sharePath -Force | Out-Null
+}
+# Set sharing options
+Set-NetSharingProfile -Name "Private" -NetworkCategory Private -SharingEnabled $true -DefaultSharingSetting "Private"
+Set-NetSharingProfile -Name "Private" -NetworkDiscoveryEnabled $true
+Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters" -Name "AutoShareWks" -Value 1
+Set-SmbShare -Name "Users" -FolderEnumerationMode AccessBased -Force
+Set-SmbServerSetting -EnableSMB1Protocol $false -Force
+Set-SmbServerSetting -EnableSMB2Protocol $true -Force
+# Disable password protected sharing
+Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "LimitBlankPasswordUse" -Value 0
+
+
+
+# Change power plan to High Performance
+$guid = [guid]::NewGuid()
+powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 $guid
+powercfg /setactive $guid
+
+# Set language to English and adjust date/time formats
+Set-WinSystemLocale en-US
+Set-WinUserLanguageList en-US -Force
+$culture = Get-Culture
+$culture.DateTimeFormat.LongDatePattern = 'dddd, d MMMM yyyy'
+$culture.DateTimeFormat.ShortDatePattern = 'd/MM/yyyy'
+$culture.DateTimeFormat.FirstDayOfWeek = 'Monday'
+$culture.DateTimeFormat.LongTimePattern = 'HH:mm:ss'
+$culture.DateTimeFormat.ShortTimePattern = 'HH:mm'
+Set-Culture $culture
+
+# Taskbar and UI tweaks
+Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name "TaskbarAl" -Type DWord -Value 0
+Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name "TaskbarMn" -Type DWord -Value 0
+
+# Remove Widgets icon
+New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" -Force | Out-Null
+Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" -Name "AllowNewsAndInterests" -Type DWord -Value 0
+
+# Privacy and telemetry hardening
+$privacyPaths = @(
+  @{Path="HKLM:\Software\Policies\Microsoft\Windows\DataCollection"; Name="AllowTelemetry"; Value=0},
+  @{Path="HKCU:\Software\Microsoft\Windows\CurrentVersion\Search"; Name="BingSearchEnabled"; Value=0},
+  @{Path="HKLM:\System\CurrentControlSet\Services\lfsvc\Service\Configuration"; Name="Status"; Value=0},
+  @{Path="HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo"; Name="Enabled"; Value=0},
+  @{Path="HKCU:\Software\Microsoft\Siuf\Rules"; Name="NumberOfSIUFInPeriod"; Value=0},
+  @{Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows\System"; Name="EnableActivityFeed"; Value=0},
+  @{Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows\System"; Name="PublishUserActivities"; Value=0},
+  @{Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows\System"; Name="UploadUserActivities"; Value=0}
+)
+foreach ($p in $privacyPaths) {
+  if (!(Test-Path $p.Path)) { New-Item -Path $p.Path -Force | Out-Null }
+  Set-ItemProperty -Path $p.Path -Name $p.Name -Type DWord -Value $p.Value
+}
+
+# Disable Copilot
+New-Item -Path "HKCU:\Software\Policies\Microsoft\Windows\WindowsCopilot" -Force | Out-Null
+Set-ItemProperty -Path "HKCU:\Software\Policies\Microsoft\Windows\WindowsCopilot" -Name "TurnOffWindowsCopilot" -Type DWord -Value 1
+
+# Disable feedback and tips
+Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" -Name "SubscribedContent-338389Enabled" -Type DWord -Value 0
+Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" -Name "SubscribedContent-310093Enabled" -Type DWord -Value 0
+Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" -Name "SubscribedContent-338388Enabled" -Type DWord -Value 0
+Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" -Name "RotatingLockScreenEnabled" -Type DWord -Value 0
+Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" -Name "RotatingLockScreenOverlayEnabled" -Type DWord -Value 0
+
+# Disable background apps
+New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy" -Force | Out-Null
+Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy" -Name "LetAppsRunInBackground" -Type DWord -Value 2
+
+# Disable Cortana
+Get-AppxPackage -allusers Microsoft.549981C3F5F10 | Remove-AppxPackage
+
+# Stop and disable diagnostics
+Stop-Service DiagTrack -ErrorAction SilentlyContinue
+Set-Service DiagTrack -StartupType Disabled
+
+# UI: Hide Search, Task View, Show File Extensions
+Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name "ShowTaskViewButton" -Type DWord -Value 0
+Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search" -Name "SearchboxTaskbarMode" -Type DWord -Value 0
+Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name "HideFileExt" -Type DWord -Value 0
+
+# Remove known folders (Music, Videos, etc.)
+$knownFolders = @(
+  "{3dfdf296-dbec-4fb4-81d1-6a3438bcf4de}", "{1CF1260C-4DD0-4ebb-811F-33C572699FDE}",
+  "{f86fa3ab-70d2-4fc7-9c99-fcbf05467f3a}", "{A0953C92-50DC-43bf-BE83-3742FED03C9C}",
+  "{3ADD1653-EB32-4cb0-BBD7-DFA0ABB5ACCA}", "{24ad3ad4-a569-4530-98e1-ab02f9417aa8}"
+)
+foreach ($guid in $knownFolders) {
+  Remove-Item -Path "HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\MyComputer\NameSpace\$guid" -Recurse -ErrorAction SilentlyContinue
+}
+
+# Remove built-in apps (modern bloat)
+$appList = @(
+  "Microsoft.3DBuilder",
+  "Microsoft.BingFinance",
+  "Microsoft.BingNews",
+  "Microsoft.BingSports",
+  "Microsoft.BingWeather",
+  "Microsoft.Getstarted",
+  "Microsoft.MicrosoftOfficeHub",
+  "Microsoft.MicrosoftSolitaireCollection",
+  "Microsoft.Office.OneNote",
+  "Microsoft.People",
+  "Microsoft.SkypeApp",
+  "Microsoft.WindowsAlarms",
+  "Microsoft.WindowsCamera",
+  "Microsoft.WindowsMaps",
+  "Microsoft.WindowsPhone",
+  "Microsoft.WindowsSoundRecorder",
+  "Microsoft.XboxApp",
+  "Microsoft.ZuneMusic",
+  "Microsoft.ZuneVideo",
+  "Microsoft.AppConnector",
+  "Microsoft.ConnectivityStore",
+  "Microsoft.Office.Sway",
+  "Microsoft.Messaging",
+  "Microsoft.CommsPhone",
+  "9E2F88E3.Twitter",
+  "king.com.CandyCrushSodaSaga",
+  "Microsoft.GamingApp",
+  "Microsoft.YourPhone",
+  "Microsoft.XboxGamingOverlay",
+  "Microsoft.XboxIdentityProvider",
+  "Microsoft.XboxSpeechToTextOverlay",
+  "Microsoft.XboxGameOverlay",
+  "Microsoft.Xbox.TCUI",
+  "Microsoft.OneDriveSync",
+  "MicrosoftWindows.Client.WebExperience",
+  "Microsoft.Clipchamp",
+  "Microsoft.WindowsFeedbackHub"
+)
+foreach ($app in $appList) {
+  Get-AppxPackage -AllUsers $app | Remove-AppxPackage -ErrorAction SilentlyContinue
+}
+
+
+# Chocolatey: install useful packages
+if (!(Get-Command choco.exe -ErrorAction SilentlyContinue)) {
+    Set-ExecutionPolicy Bypass -Scope Process -Force
+    Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))
+}
+$packages = @(
+  "adobereader", 
+  "7zip", 
+  "dotnetfx", 
+  "freefilesync", 
+  "GoogleChrome", 
+  "jre8", 
+  "notepadplusplus.install", 
+  "Office365Business", 
+  "sumatrapdf", 
+  "vlc"
+)
+foreach ($pkg in $packages) { choco install $pkg -y }
+
+# Set wallpaper
+$imageUrl = "https://hp-iot.nl/promotiemateriaal/Pot%20logo%20kleur.png"
+$localFile = "C:\Scripts\wallpaper.png"
+Invoke-WebRequest -Uri $imageUrl -OutFile $localFile
+Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop\' -Name Wallpaper -Value $localFile
+Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop\' -Name TileWallpaper -Value 0
+Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop\' -Name WallpaperStyle -Value 0
+RUNDLL32.EXE USER32.DLL,UpdatePerUserSystemParameters 1, True
+
+# Install Potvis as a web app using Microsoft Edge
+$webAppUrl = "https://potvisprod.crm4.dynamics.com/main.aspx?appid=ffa5f36a-e720-ee11-9967-6045bd89a9e6"
+$appName = "Potvis"
+$iconUrl = "https://pot-scheepvaart.nl/potvis/PSLOGO.ico"
+$edgePath = "$env:ProgramFiles (x86)\Microsoft\Edge\Application\msedge.exe"
+if (-not (Test-Path $edgePath)) {
+    $edgePath = "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe"
+}
+if (Test-Path $edgePath) {
+    Start-Process -FilePath $edgePath -ArgumentList "--install-app=$webAppUrl --app-name=$appName --app-icon=$iconUrl"
+} else {
+    Write-Warning "Microsoft Edge is not installed or not found. Skipping Potvis web app installation."
+}
+
+# Datema Software
+$softwareList = @(
+  @{url="https://chartplanner.datema.nl/ChartplannerReleases/setup.exe"; out="C:\Scripts\chartplanner.exe"},
+  @{url="https://hp-iot.nl/software/ADP_V19.zip"; out="C:\Scripts\software.zip"},
+  @{url="https://hp-iot.nl/software/e-np.zip"; out="C:\Scripts\software.zip"},
+  @{url="https://hp-iot.nl/software/MaradPrerequisites-2022.zip"; out="C:\Scripts\software.zip"}
+)
+foreach ($s in $softwareList) {
+  Invoke-WebRequest -Uri $s.url -OutFile $s.out
+  if ($s.out -like "*.zip") { Expand-Archive -Path $s.out -DestinationPath "C:\Scripts" }
+}
+
+# Install software silently (examples)
+Start-Process -FilePath "C:\Scripts\chartplanner.exe" /S -Wait
+Start-Process -FilePath "C:\Scripts\ISSetup.exe" /S -Wait
+Start-Process -FilePath "C:\Scripts\e-NP_Reader_1.4.exe" /S -Wait
+Start-Process -FilePath "C:\Scripts\install.exe" /S -Wait
+Start-Process -FilePath "https://hp-iot.nl/software/MaradEmptyInstallation.exe" /S -Wait
+
+# Clean up
+Remove-Item C:\Scripts\* -Force -Recurse
+Remove-Item 'C:\Users\*\Desktop\*' -Force -Recurse -ErrorAction SilentlyContinue
+
+# Windows Updates
+Install-Module -Name PSWindowsUpdate -Force -Confirm:$false
+Import-Module PSWindowsUpdate
+Get-WindowsUpdate -AcceptAll -Install -AutoReboot

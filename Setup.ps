@@ -78,6 +78,23 @@ Set-Culture $culture
 Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name "TaskbarAl" -Type DWord -Value 0
 Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name "TaskbarMn" -Type DWord -Value 0
 
+
+# Path to Taskbar Pinned Apps
+$taskbarPinnedAppsPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband"
+reg export "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband" $backupPath /y
+
+# Remove Microsoft Store pinned icon by resetting pinned items
+Remove-ItemProperty -Path $taskbarPinnedAppsPath -Name "Favorites" -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path $taskbarPinnedAppsPath -Name "FavoritesResolve" -ErrorAction SilentlyContinue
+
+# Fully disable Windows Copilot via Policy
+Write-Host "Disabling Windows Copilot system-wide..."
+$policyPath = "HKCU:\Software\Policies\Microsoft\Windows\WindowsCopilot"
+If (!(Test-Path $policyPath)) {
+    New-Item -Path $policyPath -Force | Out-Null
+}
+Set-ItemProperty -Path $policyPath -Name "TurnOffWindowsCopilot" -Type DWord -Value 1
+
 # Remove Widgets icon
 New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" -Force | Out-Null
 Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" -Name "AllowNewsAndInterests" -Type DWord -Value 0
@@ -179,6 +196,13 @@ foreach ($app in $appList) {
   Get-AppxPackage -AllUsers $app | Remove-AppxPackage -ErrorAction SilentlyContinue
 }
 
+#Install .net, needed for Marad
+Write-Host "Installing .NET Framework 2.0, 3.0, 3.5, and 4.7..."
+# Enable .NET Framework 3.5 (includes 2.0 and 3.0)
+Enable-WindowsOptionalFeature -Online -FeatureName NetFx3 -All -NoRestart
+# Enable .NET Framework 4.7 (included as part of .NET 4.x feature)
+Enable-WindowsOptionalFeature -Online -FeatureName NetFx4-AdvSrvs -All -NoRestart
+Enable-WindowsOptionalFeature -Online -FeatureName NetFx4Extended-ASPNET45 -All -NoRestart
 
 # Chocolatey: install useful packages
 if (!(Get-Command choco.exe -ErrorAction SilentlyContinue)) {
@@ -224,10 +248,7 @@ if (Test-Path $edgePath) {
 
 # Datema Software
 $softwareList = @(
-  @{url="https://chartplanner.datema.nl/ChartplannerReleases/setup.exe"; out="C:\Scripts\chartplanner.exe"},
-  @{url="https://hp-iot.nl/software/ADP_V19.zip"; out="C:\Scripts\software.zip"},
-  @{url="https://hp-iot.nl/software/e-np.zip"; out="C:\Scripts\software.zip"},
-  @{url="https://hp-iot.nl/software/MaradPrerequisites-2022.zip"; out="C:\Scripts\software.zip"}
+  @{url="https://chartplanner.datema.nl/chartplannerreleases/setup.exe"; out="C:\Scripts\chartplanner.exe"}
 )
 foreach ($s in $softwareList) {
   Invoke-WebRequest -Uri $s.url -OutFile $s.out

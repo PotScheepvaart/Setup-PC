@@ -24,8 +24,7 @@ $Username = "share"
 $Password = ConvertTo-SecureString "share" -AsPlainText -Force
 if (-not (Get-LocalUser -Name $Username -ErrorAction SilentlyContinue)) {
     New-LocalUser -Name $Username -Password $Password -FullName "Share User" -Description "User account for file sharing"
-    Add-LocalGroupMember -Group "Users" -Member $Username
-}
+    Add-LocalGroupMember -Group "Users" 
 
 
 # Enable file sharing on private networks and disable password-protected sharing
@@ -247,23 +246,26 @@ if (Test-Path $edgePath) {
 }
 
 # Datema Software
-$softwareList = @(
-  @{url="https://chartplanner.datema.nl/chartplannerreleases/setup.exe"; out="C:\Scripts\chartplanner.exe"}
-)
-foreach ($s in $softwareList) {
-  Invoke-WebRequest -Uri $s.url -OutFile $s.out
-  if ($s.out -like "*.zip") { Expand-Archive -Path $s.out -DestinationPath "C:\Scripts" }
-}
+Write-Host "Downloading and installing Chartplanner..."
+    # Define variables
+    $chartplannerUrl = "https://chartplanner.datema.nl/chartplannerreleases/setup.exe"
+    $installerPath = "C:\Scripts\chartplanner_setup.exe"
 
-# Install software silently (examples)
-Start-Process -FilePath "C:\Scripts\chartplanner.exe" /S -Wait
-Start-Process -FilePath "C:\Scripts\ISSetup.exe" /S -Wait
-Start-Process -FilePath "C:\Scripts\e-NP_Reader_1.4.exe" /S -Wait
-Start-Process -FilePath "C:\Scripts\install.exe" /S -Wait
-Start-Process -FilePath "https://hp-iot.nl/software/MaradEmptyInstallation.exe" /S -Wait
+    # Create directory if it doesn't exist
+    if (-not (Test-Path "C:\Scripts")) {
+        New-Item -ItemType Directory -Path "C:\Scripts" | Out-Null
+    }
+    # Download the installer
+    Invoke-WebRequest -Uri $chartplannerUrl -OutFile $installerPath
+    # Install silently (assuming /S is the silent switch)
+    Start-Process -FilePath $installerPath -ArgumentList "/S" -NoNewWindow -Wait
+    Write-Host "Chartplanner installation completed."
+
+
+
+#Start-Process -FilePath "https://hp-iot.nl/software/MaradEmptyInstallation.exe" /S -Wait
 
 # Clean up
-Remove-Item C:\Scripts\* -Force -Recurse
 Remove-Item 'C:\Users\*\Desktop\*' -Force -Recurse -ErrorAction SilentlyContinue
 
 # Windows Updates

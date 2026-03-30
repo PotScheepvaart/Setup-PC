@@ -24,8 +24,7 @@ $Username = "share"
 $Password = ConvertTo-SecureString "share" -AsPlainText -Force
 if (-not (Get-LocalUser -Name $Username -ErrorAction SilentlyContinue)) {
     New-LocalUser -Name $Username -Password $Password -FullName "Share User" -Description "User account for file sharing"
-    Add-LocalGroupMember -Group "Users" 
-
+    Add-LocalGroupMember -Group "Users" }
 
 # Enable file sharing on private networks and disable password-protected sharing
 Write-Host "Configuring file sharing settings..."

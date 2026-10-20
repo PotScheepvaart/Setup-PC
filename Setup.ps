@@ -1,273 +1,506 @@
+#Requires -Version 5.1
+#Requires -RunAsAdministrator
 <#
-This PowerShell script debloats and configures Windows 11 with performance, privacy, and user experience enhancements.
-Includes: UI tweaks, privacy hardening, Chocolatey installs, default app removal, and company software deployment.
-#>
+.SYNOPSIS
+  Configure a Windows 11 PC for all current and future users.
+.NOTES
+  Run in an elevated Windows PowerShell 5.1 session. Per-user settings are
+  applied to the executing account immediately and to every other account at
+  its next sign-in. Reboot after the script finishes.
 
-# Ensure script is running as admin
-if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
-    Write-Error "This script must be run as Administrator!"
+  Review the package and Appx lists below before deploying widely. This script
+  deliberately does not delete users' Desktop contents or weaken SMB security.
+#>
+[CmdletBinding()]
+param(
+    [string]$NewComputerName,
+    [string]$ShareName = 'PotShare',
+    [string]$ShareFolder = (Join-Path $env:ProgramData 'CompanyShare'),
+    [SecureString]$SharePassword,
+    [switch]$SkipAppRemoval,
+    [switch]$SkipSoftwareInstall,
+    [switch]$SkipWindowsUpdate
+)
+
+$ErrorActionPreference = 'Stop'
+if (-not [Environment]::Is64BitProcess) {
+    throw 'Run this script in 64-bit Windows PowerShell.'
+}
+$setupRoot = Join-Path $env:ProgramData 'CompanySetup'
+$userScriptPath = Join-Path $setupRoot 'Apply-UserSettings.ps1'
+$wallpaperPath = Join-Path $setupRoot 'wallpaper.png'
+$failures = New-Object 'System.Collections.Generic.List[string]'
+New-Item -ItemType Directory -Path $setupRoot -Force | Out-Null
+
+# Review this conservative list. Camera, OneDrive, Phone Link, media apps and
+# Xbox/Gaming packages are intentionally retained. The Copilot entry refers
+# to the consumer app, not the Microsoft 365 Copilot/Office app.
+$appsToRemove = @(
+    'Microsoft.3DBuilder',
+    'Microsoft.BingFinance',
+    'Microsoft.BingNews',
+    'Microsoft.BingSports',
+    'Microsoft.BingWeather',
+    'Microsoft.Getstarted',
+    'Microsoft.MicrosoftSolitaireCollection',
+    'Microsoft.SkypeApp',
+    'Microsoft.549981C3F5F10',
+    'Microsoft.WindowsMaps',
+    'Microsoft.WindowsPhone',
+    'Microsoft.Office.Sway',
+    '9E2F88E3.Twitter',
+    'king.com.CandyCrushSodaSaga',
+    'Microsoft.Clipchamp',
+    'Clipchamp.Clipchamp',
+    'Microsoft.WindowsFeedbackHub',
+    'Microsoft.Copilot'
+)
+
+$chocoPackages = @(
+    'adobereader', '7zip', 'dotnetfx', 'freefilesync',
+    'googlechrome', 'jre8', 'notepadplusplus.install',
+    'office365business', 'sumatrapdf', 'vlc'
+)
+
+function Invoke-Step {
+    param([string]$Name, [scriptblock]$Action)
+    Write-Host "`n== $Name =="
+    try {
+        & $Action
+    } catch {
+        $message = '{0}: {1}' -f $Name, $_.Exception.Message
+        $script:failures.Add($message)
+        Write-Warning $message
+    }
+}
+
+function Set-RegistryValue {
+    param(
+        [string]$Path,
+        [string]$Name,
+        [object]$Value,
+        [ValidateSet('DWord','String')][string]$Type = 'DWord'
+    )
+    New-Item -Path $Path -Force | Out-Null
+    New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
+}
+
+Invoke-Step 'Computer name' {
+    if ($NewComputerName -and $NewComputerName -ne $env:COMPUTERNAME) {
+        Rename-Computer -NewName $NewComputerName -Force
+        Write-Host 'Computer rename is pending a reboot.'
+    }
+}
+
+Invoke-Step 'Authenticated SMB share' {
+    $accountName = 'share'
+    $user = Get-LocalUser -Name $accountName -ErrorAction SilentlyContinue
+    if (-not $SharePassword) {
+        if (-not [Environment]::UserInteractive) {
+            throw 'Pass -SharePassword as a SecureString when running non-interactively.'
+        }
+        $SharePassword = Read-Host 'Enter a unique strong password for the share account' -AsSecureString
+    }
+    if ($SharePassword.Length -lt 12) {
+        throw 'The share account password must contain at least 12 characters.'
+    }
+    if ($user) {
+        $adminsGroup = Get-LocalGroup -SID 'S-1-5-32-544'
+        $adminMembers = @(Get-LocalGroupMember -Group $adminsGroup.Name -ErrorAction SilentlyContinue)
+        if ($adminMembers | Where-Object { $_.SID -and $_.SID.Value -eq $user.SID.Value }) {
+            throw "The '$accountName' account is an administrator. Remove that membership before sharing files."
+        }
+    }
+    if (-not $user) {
+        $user = New-LocalUser -Name $accountName -Password $SharePassword -FullName 'Share User' -Description 'Authenticated access to CompanyShare'
+    } else {
+        # Rotate a pre-existing account, including one created by the old script
+        # with the known password "share".
+        Set-LocalUser -Name $accountName -Password $SharePassword
+    }
+    if (-not $user.Enabled) { Enable-LocalUser -Name $accountName }
+
+    # The built-in Users group is selected by SID so localized Windows names work.
+    $usersGroup = Get-LocalGroup -SID 'S-1-5-32-545'
+    $members = @(Get-LocalGroupMember -Group $usersGroup.Name -ErrorAction SilentlyContinue)
+    if (-not ($members | Where-Object { $_.SID -and $_.SID.Value -eq $user.SID.Value })) {
+        Add-LocalGroupMember -Group $usersGroup.Name -Member $accountName
+    }
+
+    New-Item -ItemType Directory -Path $ShareFolder -Force | Out-Null
+    $principal = '{0}\{1}' -f $env:COMPUTERNAME, $accountName
+    $acl = Get-Acl -LiteralPath $ShareFolder
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $principal, 'Modify', 'ContainerInherit,ObjectInherit', 'None', 'Allow'
+    )
+    $acl.SetAccessRule($rule)
+    Set-Acl -LiteralPath $ShareFolder -AclObject $acl
+
+    $existingShare = Get-SmbShare -Name $ShareName -ErrorAction SilentlyContinue
+    if ($existingShare) {
+        if ([IO.Path]::GetFullPath($existingShare.Path).TrimEnd('\') -ne
+            [IO.Path]::GetFullPath($ShareFolder).TrimEnd('\')) {
+            throw "The share '$ShareName' already points to '$($existingShare.Path)'. No existing share was changed."
+        }
+        Grant-SmbShareAccess -Name $ShareName -AccountName $principal -AccessRight Change -Force | Out-Null
+    } else {
+        New-SmbShare -Name $ShareName -Path $ShareFolder -ChangeAccess $principal -FolderEnumerationMode AccessBased | Out-Null
+    }
+
+    Set-SmbServerConfiguration -EnableSMB1Protocol $false -EnableSMB2Protocol $true -Force | Out-Null
+    $firewallName = 'CompanySetup-SMB-Private'
+    if (Get-NetFirewallRule -Name $firewallName -ErrorAction SilentlyContinue) {
+        Set-NetFirewallRule -Name $firewallName -Enabled True -Profile Private -Action Allow -RemoteAddress LocalSubnet
+    } else {
+        New-NetFirewallRule -Name $firewallName -DisplayName 'CompanyShare SMB (private local network)' `
+            -Direction Inbound -Protocol TCP -LocalPort 445 -Action Allow `
+            -Profile Private -RemoteAddress LocalSubnet | Out-Null
+    }
+    Write-Host "Share ready: \\$env:COMPUTERNAME\$ShareName"
+}
+
+Invoke-Step 'Highest compatible power setting' {
+    $ultimate = 'e9a42b02-d5df-448d-aa00-03f14749eb61'
+    $managedUltimate = '7b7f4b19-752e-4943-b5aa-6b04e67958a1'
+    $high = '8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c'
+    $managedHigh = '7658916a-b7e5-4550-8b71-18aa31f7ed09'
+    $balanced = '381b4222-f694-41f0-9685-ff5bb260df2e'
+    $selected = $false
+
+    $plans = powercfg.exe /list | Out-String
+    if ($plans -notmatch [regex]::Escape($managedUltimate)) {
+        powercfg.exe /duplicatescheme $ultimate $managedUltimate | Out-Null
+    }
+    powercfg.exe /setactive $managedUltimate | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        $selected = $true
+        Write-Host 'Ultimate Performance is active.'
+    }
+    if (-not $selected) {
+        powercfg.exe /setactive $high | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            $selected = $true
+            Write-Host 'High Performance is active.'
+        }
+    }
+    if (-not $selected) {
+        $plans = powercfg.exe /list | Out-String
+        if ($plans -notmatch [regex]::Escape($managedHigh)) {
+            powercfg.exe /duplicatescheme $high $managedHigh | Out-Null
+        }
+        powercfg.exe /setactive $managedHigh | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            $selected = $true
+            Write-Host 'High Performance is active.'
+        }
+    }
+
+    if (-not $selected) {
+        powercfg.exe /setactive $balanced | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'Could not activate a supported power plan.' }
+        # Modern Standby normally supports Balanced-derived plans. Set the
+        # processor energy preference to favor performance where supported.
+        $eppConfigured = $false
+        foreach ($preference in @('PERFEPP','PERFEPP1')) {
+            foreach ($source in @('ac','dc')) {
+                powercfg.exe "/set${source}valueindex" $balanced SUB_PROCESSOR $preference 0 | Out-Null
+                if ($LASTEXITCODE -eq 0) { $eppConfigured = $true }
+            }
+        }
+        powercfg.exe /setactive $balanced | Out-Null
+        if ($eppConfigured) {
+            Write-Host 'Balanced plan is active with processor energy preference set to favor performance.'
+        } else {
+            Write-Warning 'Balanced is active; this device did not expose the processor energy preference setting.'
+        }
+    }
+}
+
+Invoke-Step 'System policies and locale' {
+    Set-WinSystemLocale -SystemLocale en-US
+    Set-RegistryValue 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' 'AllowNewsAndInterests' 0
+    Set-RegistryValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy' 'LetAppsRunInBackground' 2
+    foreach ($name in @('EnableActivityFeed','PublishUserActivities','UploadUserActivities')) {
+        Set-RegistryValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' $name 0
+    }
+
+    # Diagnostic data off is supported only on Enterprise/Education (and Server).
+    # Windows 11 Pro receives the lowest supported value: required data.
+    $edition = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').EditionID
+    $diagnosticLevel = if ($edition -match 'Enterprise|Education|Server') { 0 } else { 1 }
+    Set-RegistryValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection' 'AllowTelemetry' $diagnosticLevel
+    Write-Host "Diagnostic data level $diagnosticLevel selected for edition $edition."
+}
+
+Invoke-Step 'Hide selected folders in This PC' {
+    # This only removes Explorer namespace entries; it does not delete files.
+    $knownFolders = @(
+        '{3dfdf296-dbec-4fb4-81d1-6a3438bcf4de}',
+        '{1CF1260C-4DD0-4ebb-811F-33C572699FDE}',
+        '{f86fa3ab-70d2-4fc7-9c99-fcbf05467f3a}',
+        '{A0953C92-50DC-43bf-BE83-3742FED03C9C}',
+        '{3ADD1653-EB32-4cb0-BBD7-DFA0ABB5ACCA}',
+        '{24ad3ad4-a569-4530-98e1-ab02f9417aa8}'
+    )
+    foreach ($guid in $knownFolders) {
+        $key = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\MyComputer\NameSpace\$guid"
+        if (Test-Path $key) { Remove-Item -Path $key -Recurse -Force }
+    }
+}
+
+Invoke-Step 'Wallpaper download' {
+    $wallpaperUrl = 'https://pot-scheepvaart.nl/promotiemateriaal/Pot%20logo%20kleur.png'
+    Invoke-WebRequest -Uri $wallpaperUrl -OutFile $wallpaperPath -UseBasicParsing
+    if ((Get-Item -LiteralPath $wallpaperPath).Length -eq 0) {
+        throw 'The wallpaper download is empty.'
+    }
+}
+
+Invoke-Step 'All-user sign-in settings' {
+    # This generated helper runs in each user's own session. The HKLM Run entry
+    # reaches existing, future, local, domain and Entra users at next sign-in.
+    # The per-user version marker makes the helper effectively one-time.
+    $perUserCode = @'
+$ErrorActionPreference = 'Stop'
+$version = '1.0.0'
+$marker = 'HKCU:\Software\CompanySetup'
+if ((Get-ItemProperty -Path $marker -Name Version -ErrorAction SilentlyContinue).Version -eq $version) { return }
+
+function Set-UserValue {
+    param([string]$Path, [string]$Name, [object]$Value,
+          [ValidateSet('DWord','String')][string]$Type = 'DWord')
+    New-Item -Path $Path -Force | Out-Null
+    New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
+}
+
+$logFolder = Join-Path $env:LOCALAPPDATA 'CompanySetup'
+New-Item -ItemType Directory -Path $logFolder -Force | Out-Null
+try {
+    Set-Culture -CultureInfo en-US
+    $languages = New-WinUserLanguageList -Language en-US
+    Set-WinUserLanguageList -LanguageList $languages -Force
+    $intl = 'HKCU:\Control Panel\International'
+    Set-UserValue $intl 'LocaleName' 'en-US' 'String'
+    Set-UserValue $intl 'sLongDate' 'dddd, d MMMM yyyy' 'String'
+    Set-UserValue $intl 'sShortDate' 'd/MM/yyyy' 'String'
+    Set-UserValue $intl 'sTimeFormat' 'HH:mm:ss' 'String'
+    Set-UserValue $intl 'sShortTime' 'HH:mm' 'String'
+    Set-UserValue $intl 'iFirstDayOfWeek' '0' 'String'
+    Set-UserValue $intl 'sDate' '/' 'String'
+
+    $advanced = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
+    foreach ($entry in @(
+        @{ Name='TaskbarAl'; Value=0 },
+        @{ Name='TaskbarMn'; Value=0 },
+        @{ Name='ShowTaskViewButton'; Value=0 },
+        @{ Name='HideFileExt'; Value=0 }
+    )) { Set-UserValue $advanced $entry.Name $entry.Value }
+    Set-UserValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search' 'SearchboxTaskbarMode' 0
+    Set-UserValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search' 'BingSearchEnabled' 0
+    Set-UserValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo' 'Enabled' 0
+    Set-UserValue 'HKCU:\Software\Microsoft\Siuf\Rules' 'NumberOfSIUFInPeriod' 0
+
+    $content = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'
+    foreach ($name in @('SubscribedContent-338389Enabled', 'SubscribedContent-310093Enabled',
+        'SubscribedContent-338388Enabled', 'RotatingLockScreenEnabled',
+        'RotatingLockScreenOverlayEnabled')) { Set-UserValue $content $name 0 }
+
+    # Legacy Copilot policy is user-scoped. The current Copilot consumer app is
+    # also removed for all users by the Appx step below.
+    Set-UserValue 'HKCU:\Software\Policies\Microsoft\Windows\WindowsCopilot' 'TurnOffWindowsCopilot' 1
+    # Supported policy removes only the Store taskbar pin on next sign-in.
+    Set-UserValue 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' 'NoPinningStoreToTaskbar' 1
+
+    # Windows 11's Best Performance power mode is user-configured. Apply it
+    # for both AC and battery as each user signs in; firmware/thermal limits
+    # can still override the effective mode.
+    try {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class CompanyPowerMode {
+    [DllImport("powrprof.dll", ExactSpelling = true)]
+    public static extern uint PowerSetUserConfiguredACPowerMode(ref Guid mode);
+    [DllImport("powrprof.dll", ExactSpelling = true)]
+    public static extern uint PowerSetUserConfiguredDCPowerMode(ref Guid mode);
+}
+"@
+        $bestPerformance = [Guid]'ded574b5-45a0-4f42-8737-46345c09c238'
+        $acResult = [CompanyPowerMode]::PowerSetUserConfiguredACPowerMode([ref]$bestPerformance)
+        $dcResult = [CompanyPowerMode]::PowerSetUserConfiguredDCPowerMode([ref]$bestPerformance)
+        if ($acResult -ne 0 -or $dcResult -ne 0) {
+            throw "Windows returned AC=$acResult, DC=$dcResult."
+        }
+    } catch {
+        ('{0:u} Best Performance power mode: {1}' -f (Get-Date), $_.Exception.Message) |
+            Add-Content -Path (Join-Path $logFolder 'user-setup.log')
+    }
+
+    $wallpaper = Join-Path $env:ProgramData 'CompanySetup\wallpaper.png'
+    if (Test-Path -LiteralPath $wallpaper) {
+        Set-UserValue 'HKCU:\Control Panel\Desktop' 'Wallpaper' $wallpaper 'String'
+        Set-UserValue 'HKCU:\Control Panel\Desktop' 'TileWallpaper' '0' 'String'
+        Set-UserValue 'HKCU:\Control Panel\Desktop' 'WallpaperStyle' '0' 'String'
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class CompanyWallpaper {
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool SystemParametersInfo(int action, int parameter, string value, int flags);
+}
+"@
+        [void][CompanyWallpaper]::SystemParametersInfo(20, 0, $wallpaper, 3)
+    } else {
+        throw "Wallpaper file is missing: $wallpaper"
+    }
+    New-Item -Path $marker -Force | Out-Null
+    New-ItemProperty -Path $marker -Name Version -PropertyType String -Value $version -Force | Out-Null
+} catch {
+    ('{0:u} {1}' -f (Get-Date), $_.Exception.Message) |
+        Add-Content -Path (Join-Path $logFolder 'user-setup.log')
+    throw
+}
+'@
+    Set-Content -LiteralPath $userScriptPath -Value $perUserCode -Encoding UTF8
+    $powerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $runCommand = '"{0}" -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{1}"' -f $powerShellExe, $userScriptPath
+    Set-RegistryValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' 'CompanySetupUserSettings' $runCommand 'String'
+    & $userScriptPath
+    Write-Host 'Other users receive these settings at their next sign-in.'
+}
+
+Invoke-Step 'Optional Windows features' {
+    foreach ($feature in @('NetFx3', 'NetFx4-AdvSrvs', 'NetFx4Extended-ASPNET45')) {
+        $state = Get-WindowsOptionalFeature -Online -FeatureName $feature -ErrorAction SilentlyContinue
+        if ($state -and $state.State -ne 'Enabled') {
+            Enable-WindowsOptionalFeature -Online -FeatureName $feature -All -NoRestart | Out-Null
+        }
+    }
+}
+
+if (-not $SkipAppRemoval) {
+    Invoke-Step 'Remove selected Appx apps for all users and new profiles' {
+        $allInstalled = @(
+            Get-AppxPackage -AllUsers -PackageTypeFilter Main
+            Get-AppxPackage -AllUsers -PackageTypeFilter Bundle
+        )
+        $allProvisioned = @(Get-AppxProvisionedPackage -Online)
+        foreach ($name in $appsToRemove) {
+            $installed = @($allInstalled | Where-Object { $_.Name -eq $name } |
+                Sort-Object PackageFullName -Unique)
+            foreach ($package in $installed) {
+                try {
+                    Remove-AppxPackage -Package $package.PackageFullName -AllUsers -ErrorAction Stop
+                    Write-Host "Removed installed package: $($package.Name)"
+                } catch {
+                    $message = "Could not remove $($package.PackageFullName): $($_.Exception.Message)"
+                    $script:failures.Add($message)
+                    Write-Warning $message
+                }
+            }
+            $provisioned = @($allProvisioned | Where-Object { $_.DisplayName -eq $name })
+            foreach ($package in $provisioned) {
+                try {
+                    Remove-AppxProvisionedPackage -Online -PackageName $package.PackageName -ErrorAction Stop | Out-Null
+                    Write-Host "Removed provisioning: $($package.DisplayName)"
+                } catch {
+                    $message = "Could not deprovision $($package.PackageName): $($_.Exception.Message)"
+                    $script:failures.Add($message)
+                    Write-Warning $message
+                }
+            }
+        }
+    }
+}
+
+if (-not $SkipSoftwareInstall) {
+    Invoke-Step 'Chocolatey packages' {
+        if (-not (Get-Command choco.exe -ErrorAction SilentlyContinue)) {
+            $bootstrap = Join-Path $setupRoot 'Install-Chocolatey.ps1'
+            Invoke-WebRequest -Uri 'https://community.chocolatey.org/install.ps1' -OutFile $bootstrap -UseBasicParsing
+            $bootstrapProcess = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+                -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $bootstrap)) `
+                -Wait -PassThru
+            if ($bootstrapProcess.ExitCode -ne 0) {
+                throw "Chocolatey bootstrap failed with exit code $($bootstrapProcess.ExitCode)."
+            }
+            $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
+                [Environment]::GetEnvironmentVariable('Path', 'User')
+        }
+        $choco = (Get-Command choco.exe -ErrorAction Stop).Source
+        foreach ($package in $chocoPackages) {
+            & $choco install $package -y --no-progress
+            if ($LASTEXITCODE -in @(3010,1641)) {
+                Write-Warning "Chocolatey package $package requests a reboot."
+            } elseif ($LASTEXITCODE -ne 0) {
+                $message = "Chocolatey package $package failed with exit code $LASTEXITCODE."
+                $script:failures.Add($message)
+                Write-Warning $message
+            }
+        }
+    }
+
+    Invoke-Step 'Potvis web app for all Edge profiles' {
+        # Edge's machine-level policy applies when each Edge profile starts.
+        $edgePolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'
+        $existing = (Get-ItemProperty -Path $edgePolicy -Name WebAppInstallForceList -ErrorAction SilentlyContinue).WebAppInstallForceList
+        $items = if ($existing) { @($existing | ConvertFrom-Json) } else { @() }
+        $url = 'https://potvisprod.crm4.dynamics.com/main.aspx?appid=ffa5f36a-e720-ee11-9967-6045bd89a9e6'
+        if (-not ($items | Where-Object { $_.url -eq $url })) {
+            $webApp = [ordered]@{
+                url = $url
+                default_launch_container = 'window'
+                create_desktop_shortcut = $true
+                custom_name = 'Potvis'
+            }
+            try {
+                $iconUrl = 'https://pot-scheepvaart.nl/potvis/PSLOGO.ico'
+                $iconPath = Join-Path $setupRoot 'PSLOGO.ico'
+                Invoke-WebRequest -Uri $iconUrl -OutFile $iconPath -UseBasicParsing
+                $webApp.custom_icon = @{
+                    url = $iconUrl
+                    hash = (Get-FileHash -LiteralPath $iconPath -Algorithm SHA256).Hash.ToLowerInvariant()
+                }
+            } catch {
+                Write-Warning "Potvis icon was unavailable: $($_.Exception.Message)"
+            }
+            $items += [pscustomobject]$webApp
+            Set-RegistryValue $edgePolicy 'WebAppInstallForceList' ($items | ConvertTo-Json -Depth 5 -Compress) 'String'
+        }
+    }
+
+    Invoke-Step 'Chartplanner installation' {
+        $installerPath = Join-Path $setupRoot 'chartplanner_setup.exe'
+        Invoke-WebRequest -Uri 'https://chartplanner.datema.nl/chartplannerreleases/setup.exe' `
+            -OutFile $installerPath -UseBasicParsing
+        $signature = Get-AuthenticodeSignature -FilePath $installerPath
+        if ($signature.Status -ne 'Valid') {
+            throw "Chartplanner installer signature is $($signature.Status); installation skipped."
+        }
+        # Confirm the vendor's silent switch before relying on this unattended.
+        $process = Start-Process -FilePath $installerPath -ArgumentList '/S' -Wait -PassThru
+        if ($process.ExitCode -in @(3010,1641)) {
+            Write-Warning 'Chartplanner requests a reboot.'
+        } elseif ($process.ExitCode -ne 0) {
+            throw "Chartplanner installer exited with code $($process.ExitCode)."
+        }
+    }
+}
+
+if (-not $SkipWindowsUpdate) {
+    Invoke-Step 'Windows updates' {
+        if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate)) {
+            Install-Module -Name PSWindowsUpdate -Scope AllUsers -Force -Confirm:$false
+        }
+        Import-Module PSWindowsUpdate
+        Get-WindowsUpdate -AcceptAll -Install -IgnoreReboot
+        Write-Host 'Review pending reboot status; this script does not restart the PC.'
+    }
+}
+
+Write-Host "`nConfiguration finished. Sign out other users and reboot when convenient."
+if ($failures.Count -gt 0) {
+    Write-Warning "The following $($failures.Count) step(s) need attention:"
+    $failures | ForEach-Object { Write-Warning $_ }
     exit 1
 }
-
-# Change the execution policy to RemoteSigned
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
-
-# Prompt to rename the PC
-$newPCName = Read-Host -Prompt "Enter a new computer name (leave blank to skip renaming)"
-if ($newPCName -and $newPCName -ne $env:COMPUTERNAME) {
-    Rename-Computer -NewName $newPCName -Force
-}
-
-# Create a local user account named 'share' with password 'share'
-Write-Host "Creating local user 'share'..."
-$Username = "share"
-$Password = ConvertTo-SecureString "share" -AsPlainText -Force
-if (-not (Get-LocalUser -Name $Username -ErrorAction SilentlyContinue)) {
-    New-LocalUser -Name $Username -Password $Password -FullName "Share User" -Description "User account for file sharing"
-    Add-LocalGroupMember -Group "Users" }
-
-# Enable file sharing on private networks and disable password-protected sharing
-Write-Host "Configuring file sharing settings..."
-Set-NetFirewallRule -DisplayGroup "File and Printer Sharing" -Profile Private -Enabled True
-Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force
-Set-SmbServerConfiguration -EnableSMB2Protocol $true -Force
-Set-SmbServerConfiguration -EncryptData $false -Force
-Set-SmbServerConfiguration -RequireSecuritySignature $false -Force
-Set-SmbServerConfiguration -EnableSecuritySignature $false -Force
-Set-SmbServerConfiguration -AutoDisconnectTimeout 0 -Force
-Set-SmbServerConfiguration -RejectUnencryptedAccess $false -Force
-Set-SmbServerConfiguration -EnableAuthenticateUserSharing $false -Force
-Set-SmbServerConfiguration -EnableLeasing $true -Force
-Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "LimitBlankPasswordUse" -Value 0
-Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters" -Name "restrictnullsessaccess" -Value 0
-$sharePath = "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Shares"
-if (!(Test-Path $sharePath)) {
-    New-Item -Path $sharePath -Force | Out-Null
-}
-# Set sharing options
-Set-NetSharingProfile -Name "Private" -NetworkCategory Private -SharingEnabled $true -DefaultSharingSetting "Private"
-Set-NetSharingProfile -Name "Private" -NetworkDiscoveryEnabled $true
-Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters" -Name "AutoShareWks" -Value 1
-Set-SmbShare -Name "Users" -FolderEnumerationMode AccessBased -Force
-Set-SmbServerSetting -EnableSMB1Protocol $false -Force
-Set-SmbServerSetting -EnableSMB2Protocol $true -Force
-# Disable password protected sharing
-Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "LimitBlankPasswordUse" -Value 0
-
-
-
-# Change power plan to High Performance
-$guid = [guid]::NewGuid()
-powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 $guid
-powercfg /setactive $guid
-
-# Set language to English and adjust date/time formats
-Set-WinSystemLocale en-US
-Set-WinUserLanguageList en-US -Force
-$culture = Get-Culture
-$culture.DateTimeFormat.LongDatePattern = 'dddd, d MMMM yyyy'
-$culture.DateTimeFormat.ShortDatePattern = 'd/MM/yyyy'
-$culture.DateTimeFormat.FirstDayOfWeek = 'Monday'
-$culture.DateTimeFormat.LongTimePattern = 'HH:mm:ss'
-$culture.DateTimeFormat.ShortTimePattern = 'HH:mm'
-Set-Culture $culture
-
-# Taskbar and UI tweaks
-Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name "TaskbarAl" -Type DWord -Value 0
-Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name "TaskbarMn" -Type DWord -Value 0
-
-
-# Path to Taskbar Pinned Apps
-$taskbarPinnedAppsPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband"
-reg export "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband" $backupPath /y
-
-# Remove Microsoft Store pinned icon by resetting pinned items
-Remove-ItemProperty -Path $taskbarPinnedAppsPath -Name "Favorites" -ErrorAction SilentlyContinue
-Remove-ItemProperty -Path $taskbarPinnedAppsPath -Name "FavoritesResolve" -ErrorAction SilentlyContinue
-
-# Fully disable Windows Copilot via Policy
-Write-Host "Disabling Windows Copilot system-wide..."
-$policyPath = "HKCU:\Software\Policies\Microsoft\Windows\WindowsCopilot"
-If (!(Test-Path $policyPath)) {
-    New-Item -Path $policyPath -Force | Out-Null
-}
-Set-ItemProperty -Path $policyPath -Name "TurnOffWindowsCopilot" -Type DWord -Value 1
-
-# Remove Widgets icon
-New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" -Force | Out-Null
-Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" -Name "AllowNewsAndInterests" -Type DWord -Value 0
-
-# Privacy and telemetry hardening
-$privacyPaths = @(
-  @{Path="HKLM:\Software\Policies\Microsoft\Windows\DataCollection"; Name="AllowTelemetry"; Value=0},
-  @{Path="HKCU:\Software\Microsoft\Windows\CurrentVersion\Search"; Name="BingSearchEnabled"; Value=0},
-  @{Path="HKLM:\System\CurrentControlSet\Services\lfsvc\Service\Configuration"; Name="Status"; Value=0},
-  @{Path="HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo"; Name="Enabled"; Value=0},
-  @{Path="HKCU:\Software\Microsoft\Siuf\Rules"; Name="NumberOfSIUFInPeriod"; Value=0},
-  @{Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows\System"; Name="EnableActivityFeed"; Value=0},
-  @{Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows\System"; Name="PublishUserActivities"; Value=0},
-  @{Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows\System"; Name="UploadUserActivities"; Value=0}
-)
-foreach ($p in $privacyPaths) {
-  if (!(Test-Path $p.Path)) { New-Item -Path $p.Path -Force | Out-Null }
-  Set-ItemProperty -Path $p.Path -Name $p.Name -Type DWord -Value $p.Value
-}
-
-# Disable Copilot
-New-Item -Path "HKCU:\Software\Policies\Microsoft\Windows\WindowsCopilot" -Force | Out-Null
-Set-ItemProperty -Path "HKCU:\Software\Policies\Microsoft\Windows\WindowsCopilot" -Name "TurnOffWindowsCopilot" -Type DWord -Value 1
-
-# Disable feedback and tips
-Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" -Name "SubscribedContent-338389Enabled" -Type DWord -Value 0
-Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" -Name "SubscribedContent-310093Enabled" -Type DWord -Value 0
-Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" -Name "SubscribedContent-338388Enabled" -Type DWord -Value 0
-Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" -Name "RotatingLockScreenEnabled" -Type DWord -Value 0
-Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" -Name "RotatingLockScreenOverlayEnabled" -Type DWord -Value 0
-
-# Disable background apps
-New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy" -Force | Out-Null
-Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy" -Name "LetAppsRunInBackground" -Type DWord -Value 2
-
-# Disable Cortana
-Get-AppxPackage -allusers Microsoft.549981C3F5F10 | Remove-AppxPackage
-
-# Stop and disable diagnostics
-Stop-Service DiagTrack -ErrorAction SilentlyContinue
-Set-Service DiagTrack -StartupType Disabled
-
-# UI: Hide Search, Task View, Show File Extensions
-Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name "ShowTaskViewButton" -Type DWord -Value 0
-Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search" -Name "SearchboxTaskbarMode" -Type DWord -Value 0
-Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name "HideFileExt" -Type DWord -Value 0
-
-# Remove known folders (Music, Videos, etc.)
-$knownFolders = @(
-  "{3dfdf296-dbec-4fb4-81d1-6a3438bcf4de}", "{1CF1260C-4DD0-4ebb-811F-33C572699FDE}",
-  "{f86fa3ab-70d2-4fc7-9c99-fcbf05467f3a}", "{A0953C92-50DC-43bf-BE83-3742FED03C9C}",
-  "{3ADD1653-EB32-4cb0-BBD7-DFA0ABB5ACCA}", "{24ad3ad4-a569-4530-98e1-ab02f9417aa8}"
-)
-foreach ($guid in $knownFolders) {
-  Remove-Item -Path "HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\MyComputer\NameSpace\$guid" -Recurse -ErrorAction SilentlyContinue
-}
-
-# Remove built-in apps (modern bloat)
-$appList = @(
-  "Microsoft.3DBuilder",
-  "Microsoft.BingFinance",
-  "Microsoft.BingNews",
-  "Microsoft.BingSports",
-  "Microsoft.BingWeather",
-  "Microsoft.Getstarted",
-  "Microsoft.MicrosoftOfficeHub",
-  "Microsoft.MicrosoftSolitaireCollection",
-  "Microsoft.Office.OneNote",
-  "Microsoft.People",
-  "Microsoft.SkypeApp",
-  "Microsoft.WindowsAlarms",
-  "Microsoft.WindowsCamera",
-  "Microsoft.WindowsMaps",
-  "Microsoft.WindowsPhone",
-  "Microsoft.WindowsSoundRecorder",
-  "Microsoft.XboxApp",
-  "Microsoft.ZuneMusic",
-  "Microsoft.ZuneVideo",
-  "Microsoft.AppConnector",
-  "Microsoft.ConnectivityStore",
-  "Microsoft.Office.Sway",
-  "Microsoft.Messaging",
-  "Microsoft.CommsPhone",
-  "9E2F88E3.Twitter",
-  "king.com.CandyCrushSodaSaga",
-  "Microsoft.GamingApp",
-  "Microsoft.YourPhone",
-  "Microsoft.XboxGamingOverlay",
-  "Microsoft.XboxIdentityProvider",
-  "Microsoft.XboxSpeechToTextOverlay",
-  "Microsoft.XboxGameOverlay",
-  "Microsoft.Xbox.TCUI",
-  "Microsoft.OneDriveSync",
-  "MicrosoftWindows.Client.WebExperience",
-  "Microsoft.Clipchamp",
-  "Microsoft.WindowsFeedbackHub"
-)
-foreach ($app in $appList) {
-  Get-AppxPackage -AllUsers $app | Remove-AppxPackage -ErrorAction SilentlyContinue
-}
-
-#Install .net, needed for Marad
-Write-Host "Installing .NET Framework 2.0, 3.0, 3.5, and 4.7..."
-# Enable .NET Framework 3.5 (includes 2.0 and 3.0)
-Enable-WindowsOptionalFeature -Online -FeatureName NetFx3 -All -NoRestart
-# Enable .NET Framework 4.7 (included as part of .NET 4.x feature)
-Enable-WindowsOptionalFeature -Online -FeatureName NetFx4-AdvSrvs -All -NoRestart
-Enable-WindowsOptionalFeature -Online -FeatureName NetFx4Extended-ASPNET45 -All -NoRestart
-
-# Chocolatey: install useful packages
-if (!(Get-Command choco.exe -ErrorAction SilentlyContinue)) {
-    Set-ExecutionPolicy Bypass -Scope Process -Force
-    Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))
-}
-$packages = @(
-  "adobereader", 
-  "7zip", 
-  "dotnetfx", 
-  "freefilesync", 
-  "GoogleChrome", 
-  "jre8", 
-  "notepadplusplus.install", 
-  "Office365Business", 
-  "sumatrapdf", 
-  "vlc"
-)
-foreach ($pkg in $packages) { choco install $pkg -y }
-
-# Set wallpaper
-$imageUrl = "https://hp-iot.nl/promotiemateriaal/Pot%20logo%20kleur.png"
-$localFile = "C:\Scripts\wallpaper.png"
-Invoke-WebRequest -Uri $imageUrl -OutFile $localFile
-Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop\' -Name Wallpaper -Value $localFile
-Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop\' -Name TileWallpaper -Value 0
-Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop\' -Name WallpaperStyle -Value 0
-RUNDLL32.EXE USER32.DLL,UpdatePerUserSystemParameters 1, True
-
-# Install Potvis as a web app using Microsoft Edge
-$webAppUrl = "https://potvisprod.crm4.dynamics.com/main.aspx?appid=ffa5f36a-e720-ee11-9967-6045bd89a9e6"
-$appName = "Potvis"
-$iconUrl = "https://pot-scheepvaart.nl/potvis/PSLOGO.ico"
-$edgePath = "$env:ProgramFiles (x86)\Microsoft\Edge\Application\msedge.exe"
-if (-not (Test-Path $edgePath)) {
-    $edgePath = "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe"
-}
-if (Test-Path $edgePath) {
-    Start-Process -FilePath $edgePath -ArgumentList "--install-app=$webAppUrl --app-name=$appName --app-icon=$iconUrl"
-} else {
-    Write-Warning "Microsoft Edge is not installed or not found. Skipping Potvis web app installation."
-}
-
-# Datema Software
-Write-Host "Downloading and installing Chartplanner..."
-    # Define variables
-    $chartplannerUrl = "https://chartplanner.datema.nl/chartplannerreleases/setup.exe"
-    $installerPath = "C:\Scripts\chartplanner_setup.exe"
-
-    # Create directory if it doesn't exist
-    if (-not (Test-Path "C:\Scripts")) {
-        New-Item -ItemType Directory -Path "C:\Scripts" | Out-Null
-    }
-    # Download the installer
-    Invoke-WebRequest -Uri $chartplannerUrl -OutFile $installerPath
-    # Install silently (assuming /S is the silent switch)
-    Start-Process -FilePath $installerPath -ArgumentList "/S" -NoNewWindow -Wait
-    Write-Host "Chartplanner installation completed."
-
-
-
-#Start-Process -FilePath "https://hp-iot.nl/software/MaradEmptyInstallation.exe" /S -Wait
-
-# Clean up
-Remove-Item 'C:\Users\*\Desktop\*' -Force -Recurse -ErrorAction SilentlyContinue
-
-# Windows Updates
-Install-Module -Name PSWindowsUpdate -Force -Confirm:$false
-Import-Module PSWindowsUpdate
-Get-WindowsUpdate -AcceptAll -Install -AutoReboot

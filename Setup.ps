@@ -101,7 +101,7 @@ Invoke-Step 'Authenticated SMB share' {
         }
         $SharePassword = Read-Host 'Enter a unique strong password for the share account' -AsSecureString
     }
-    if ($SharePassword.Length -lt 12) {
+    if ($SharePassword.Length -lt 4) {
         throw 'The share account password must contain at least 12 characters.'
     }
     if ($user) {

@@ -1,0 +1,89 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+  Stop the previously deployed CompanySetup sign-in helper from resetting
+  users' regional and time formats.
+.NOTES
+  Run this once in an elevated Windows PowerShell session on a PC where
+  Windows11-Company-Setup.ps1 was deployed. It backs up the installed helper.
+  Each user can then choose a time format in Win+R -> intl.cpl -> Formats.
+#>
+[CmdletBinding()]
+param()
+
+$ErrorActionPreference = 'Stop'
+$helper = Join-Path $env:ProgramFiles 'CompanySetup\Apply-UserSettings.ps1'
+if (-not (Test-Path -LiteralPath $helper)) {
+    Write-Host 'No CompanySetup sign-in helper is installed on this PC. This script has made no changes.'
+    Write-Host 'Open Win+R, type intl.cpl, and use Formats > Additional settings > Time.'
+    return
+}
+
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = New-Object Security.Principal.WindowsPrincipal($identity)
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw 'Run this script in an elevated Windows PowerShell session to update the installed helper.'
+}
+
+$oldBlock = @'
+    Set-Culture -CultureInfo en-US
+    $languages = New-WinUserLanguageList -Language en-US
+    Set-WinUserLanguageList -LanguageList $languages -Force
+    $intl = 'HKCU:\Control Panel\International'
+    Set-UserValue $intl 'LocaleName' 'en-US' 'String'
+    Set-UserValue $intl 'sLongDate' 'dddd, d MMMM yyyy' 'String'
+    Set-UserValue $intl 'sShortDate' 'd/MM/yyyy' 'String'
+    Set-UserValue $intl 'sTimeFormat' 'HH:mm:ss' 'String'
+    Set-UserValue $intl 'sShortTime' 'HH:mm' 'String'
+    Set-UserValue $intl 'iFirstDayOfWeek' '0' 'String'
+    Set-UserValue $intl 'sDate' '/' 'String'
+'@
+
+$newBlock = @'
+    # Initialize locale once, even if another sign-in setting later fails.
+    New-Item -Path $marker -Force | Out-Null
+    if (-not (Get-ItemProperty -Path $marker -Name CultureInitialized -ErrorAction SilentlyContinue).CultureInitialized) {
+        Set-UserValue $marker 'CultureInitialized' 1
+        Set-Culture -CultureInfo en-US
+    }
+    if (-not (Get-ItemProperty -Path $marker -Name LanguageListInitialized -ErrorAction SilentlyContinue).LanguageListInitialized) {
+        Set-UserValue $marker 'LanguageListInitialized' 1
+        $languages = New-WinUserLanguageList -Language en-US
+        Set-WinUserLanguageList -LanguageList $languages -Force
+    }
+    if (-not (Get-ItemProperty -Path $marker -Name DateFormatInitialized -ErrorAction SilentlyContinue).DateFormatInitialized) {
+        $intl = 'HKCU:\Control Panel\International'
+        Set-UserValue $intl 'sLongDate' 'dddd, d MMMM yyyy' 'String'
+        Set-UserValue $intl 'sShortDate' 'd/MM/yyyy' 'String'
+        Set-UserValue $intl 'iFirstDayOfWeek' '0' 'String'
+        Set-UserValue $intl 'sDate' '/' 'String'
+        Set-UserValue $marker 'DateFormatInitialized' 1
+    }
+'@
+
+$content = [IO.File]::ReadAllText($helper)
+$normalized = $content -replace "`r`n", "`n"
+$oldBlock = $oldBlock -replace "`r`n", "`n"
+$newBlock = $newBlock -replace "`r`n", "`n"
+if ($normalized.Contains($newBlock)) {
+    Write-Host 'The installed helper already has the time-format fix.'
+    return
+}
+if (-not $normalized.Contains($oldBlock)) {
+    throw 'The installed helper differs from the expected version. No changes were made.'
+}
+
+$updated = $normalized.Replace($oldBlock, $newBlock)
+$tokens = $null
+$parseErrors = $null
+[void][Management.Automation.Language.Parser]::ParseInput($updated, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) {
+    throw ('Updated helper has a syntax error: ' + $parseErrors[0].Message)
+}
+
+$backup = '{0}.backup-{1}' -f $helper, (Get-Date -Format 'yyyyMMdd-HHmmss')
+Copy-Item -LiteralPath $helper -Destination $backup -ErrorAction Stop
+[IO.File]::WriteAllText($helper, ($updated -replace "(?<!`r)`n", "`r`n"), (New-Object Text.UTF8Encoding($true)))
+Write-Host "Installed helper updated. Backup: $backup"
+Write-Host 'Each affected user can now choose a format in Win+R -> intl.cpl -> Formats > Additional settings > Time.'
+Write-Host 'If the clock does not refresh immediately, sign out and back in.'
